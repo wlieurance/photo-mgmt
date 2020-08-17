@@ -160,7 +160,7 @@ def create_tables(dbpath, wipe):
     con = sqlite.connect(dbpath)
     con.row_factory = sqlite.Row
     con.enable_load_extension(True)
-    con.execute("SELECT load_extension('mod_spatialite.dll')")
+    con.execute("SELECT load_extension('mod_spatialite')")
     c = con.cursor()
 
     # tables

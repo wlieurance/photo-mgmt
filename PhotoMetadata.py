@@ -182,8 +182,8 @@ def create_tables(dbpath, wipe):
         c.execute('DELETE FROM dateloc;')
 
     # indices
-    c.execute("CREATE INDEX photo_md5hash_idx ON photo (md5hash);")
-    c.execute("CREATE INDEX tag_value_idx ON tag (value);")
+    c.execute("CREATE INDEX IF NOT EXISTS photo_md5hash_idx ON photo (md5hash);")
+    c.execute("CREATE INDEX IF NOT EXISTS tag_value_idx ON tag (value);")
 
     con.commit()
     con.close()
@@ -209,7 +209,7 @@ def capture_meta(path, dbpath, log, cores, chunk_size, local=False, multi=False)
                 chunk_count += len(chunk)
                 print("current chunk @", os.path.sep.join(chunk[0]))
                 if multi:
-                    with mp.Pool(processes=mp.cpu_count()-cores) as pool:
+                    with mp.Pool(processes=min([mp.cpu_count()-cores, 1])) as pool:
                         results = pool.starmap(read_file, chunk)
                 else:
                     for root, f in chunk:

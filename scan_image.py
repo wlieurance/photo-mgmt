@@ -125,61 +125,41 @@ def read_file(root, f):
     return {'root': root, 'fname': f, 'ftype': ftype, 'hash': md5checksum, 'msg': msg, 'tags': kv_list}
 
 
-def write_results(results, local, dbpath, path, log):
-    print("writing results to database...")
-    con = sqlite.connect(dbpath)
-    con.row_factory = sqlite.Row
-    c = con.cursor()
-    results.sort(key=itemgetter('root', 'fname'))
-    insert_sql = r'INSERT OR IGNORE INTO photo (path, fname, ftype, md5hash) VALUES (?,?,?,?);'
-    for r in results:
-        if r['ftype'] is not None:
-            ins_path = os.path.join(r['root'], r['fname'])
-            if local:
-                ins_path = re.sub(r'^(\\|/)', '', ins_path.replace(path, ''))
-            ins_path = ins_path.replace('\\', '/')  # standardizes path output across multiple os's
-            # print(ins_path, r['fname'], r['ftype'], r['hash'])
-            c.execute(insert_sql,
-                      (ins_path, r['fname'], r['ftype'], r['hash'],))
-            if r['tags']:
-                for t in r['tags']:
-                    if t['b']:
-                        val = sqlite.Binary(t['value'])
-                    else:
-                        val = t['value']
-                    # print(r['hash'], t['name'], val)
-                    c.execute('INSERT OR IGNORE INTO tag (md5hash, tag, value) VALUES (?,?,?);',
-                              (r['hash'], t['name'], val,))
-        if log and r['msg']:
-            log.write(r['msg'] + '\n')
-    con.commit()
-    con.close()
-
-
-def create_tables(dbpath, wipe):
+def create_tables(dbpath, wipe, geo):
     con = sqlite.connect(dbpath)
     con.row_factory = sqlite.Row
     con.enable_load_extension(True)
-    con.execute("SELECT load_extension('mod_spatialite')")
+    con.execute("PRAGMA foreign_keys = ON;")
     c = con.cursor()
 
     # tables
-    c.execute('CREATE TABLE IF NOT EXISTS photo (path TEXT PRIMARY KEY, fname TEXT, ftype TEXT, md5hash TEXT);')
-    c.execute('CREATE TABLE IF NOT EXISTS tag (md5hash TEXT, tag TEXT, value TEXT, PRIMARY KEY (md5hash, tag));')
-    c.execute('CREATE TABLE IF NOT EXISTS dateloc (fname TEXT, path TEXT, md5hash TEXT PRIMARY KEY, '
-              'datetaken TEXT, X NUMERIC, Y NUMERIC, Z NUMERIC)')
+    c.execute('CREATE TABLE IF NOT EXISTS import (import_date DATETIME PRIMARY KEY, base_path TEXT, local BOOLEAN, '
+              'type TEXT);')
+    c.execute('CREATE TABLE IF NOT EXISTS hash (md5hash TEXT PRIMARY KEY, import_date DATETIME, '
+              'FOREIGN KEY (import_date) REFERENCES import(import_date) ON DELETE CASCADE);')
+    c.execute('CREATE TABLE IF NOT EXISTS photo (path TEXT PRIMARY KEY, fname TEXT, ftype TEXT, md5hash TEXT, '
+              'FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE);')
+    c.execute('CREATE TABLE IF NOT EXISTS tag (md5hash TEXT, tag TEXT, value TEXT, PRIMARY KEY (md5hash, tag), '
+              'FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE);')
+    c.execute('CREATE TABLE IF NOT EXISTS location (md5hash TEXT PRIMARY KEY, fname TEXT, path TEXT, '
+              'taken_dt TEXT, X NUMERIC, Y NUMERIC, Z NUMERIC, FOREIGN KEY (md5hash) REFERENCES hash(md5hash) '
+              'ON DELETE CASCADE ON UPDATE CASCADE);')
 
     # geometry
-    rows = c.execute("PRAGMA table_info('dateloc');")
-    headers = []
-    for row in rows:
-        headers.append(row[1])
-    if 'geometry' not in headers:
-        c.execute("SELECT AddGeometryColumn('dateloc', 'geometry', 4326, 'POINTZ', 'XYZ');")
+    if geo:
+        con.execute("SELECT load_extension('mod_spatialite')")
+        rows = c.execute("PRAGMA table_info('location');")
+        headers = []
+        for row in rows:
+            headers.append(row[1])
+        if 'geometry' not in headers:
+            c.execute("SELECT AddGeometryColumn('location', 'geometry', 4326, 'POINTZ', 'XYZ');")
     if wipe:
-        c.execute('DELETE FROM photo;')
         c.execute('DELETE FROM tag;')
-        c.execute('DELETE FROM dateloc;')
+        c.execute('DELETE FROM photo;')
+        c.execute('DELETE FROM location;')
+        c.execute('DELETE FROM hash;')
+        c.execute('DELETE FROM import;')
 
     # indices
     c.execute("CREATE INDEX IF NOT EXISTS photo_md5hash_idx ON photo (md5hash);")
@@ -189,7 +169,52 @@ def create_tables(dbpath, wipe):
     con.close()
 
 
+def write_results(results, local, dbpath, path, import_date, log):
+    print("writing results to database...")
+    con = sqlite.connect(dbpath)
+    con.row_factory = sqlite.Row
+    con.execute("PRAGMA foreign_keys = ON;")
+    c = con.cursor()
+    results.sort(key=itemgetter('root', 'fname'))
+    hash_sql = r'INSERT OR IGNORE INTO hash (md5hash, import_date) VALUES (?,?);'
+    photo_sql = r'INSERT OR IGNORE INTO photo (path, fname, ftype, md5hash) VALUES (?,?,?,?);'
+    for r in results:
+        if r['ftype'] is not None:
+            ins_path = os.path.join(r['root'], r['fname'])
+            if local:
+                ins_path = re.sub(r'^(\\|/)', '', ins_path.replace(path, ''))
+            ins_path = ins_path.replace('\\', '/')  # standardizes path output across multiple os's
+            # print(ins_path, r['fname'], r['ftype'], r['hash'], import_date)
+            c.execute(hash_sql, (r['hash'], import_date))
+            c.execute(photo_sql, (ins_path, r['fname'], r['ftype'], r['hash']))
+            con.commit()
+            if r['tags']:
+                for t in r['tags']:
+                    if t['b']:
+                        val = sqlite.Binary(t['value'])
+                    else:
+                        val = t['value']
+                    # print(r['hash'], t['name'], val)
+                    c.execute('INSERT OR IGNORE INTO tag (md5hash, tag, value) VALUES (?,?,?);',
+                              (r['hash'], t['name'], val,))
+                con.commit()
+        if log and r['msg']:
+            log.write(r['msg'] + '\n')
+    con.close()
+
+
 def capture_meta(path, dbpath, log, cores, chunk_size, local=False, multi=False):
+    # insert import data
+    import_date = datetime.utcnow().isoformat(sep='T', timespec='seconds') + 'Z'
+    con = sqlite.connect(dbpath)
+    con.row_factory = sqlite.Row
+    c = con.cursor()
+    c.execute("INSERT OR IGNORE INTO import (import_date, base_path, local, type) VALUES (?,?,?, 'import')",
+              (import_date, re.sub(r'\\', '/', path), local))
+    con.commit()
+    con.close()
+
+    # insert photo data
     results = []
     if log:
         log.write('\nstarting capture_meta function at: ' + str(datetime.now()) + 'with multi=' + str(multi) +'\n')
@@ -221,7 +246,7 @@ def capture_meta(path, dbpath, log, cores, chunk_size, local=False, multi=False)
                 # WAL logging can be enabled but currently inserts are very fast so multiprocessing with inserts was not
                 # pursued
                 stime = datetime.now()
-                write_results(results, local, dbpath, path, log)
+                write_results(results=results, local=local, dbpath=dbpath, path=path, import_date=import_date, log=log)
                 extime = datetime.now() - stime
                 pct_complete = round((chunk_count / file_length) * 100, 1)
                 print("database writing finished in:", round(extime.total_seconds(), 1), "seconds.",
@@ -280,7 +305,7 @@ def convert_gis(dbpath, log):
             if log:
                 log.write('|'.join((row['path'], "GPS coordinate found")) + '\n')
             # print('|'.join((row['path'], "GPS coordinate found")))
-            i.execute('INSERT OR IGNORE INTO dateloc (geometry, fname, path, md5hash, datetaken, X, Y, Z) '
+            i.execute('INSERT OR IGNORE INTO location (geometry, fname, path, md5hash, taken_dt, X, Y, Z) '
                       'VALUES (MakePointZ(?,?,?,4326),?,?,?,?,?,?,?)',
                       (x, y, z, row['fname'], row['path'], row['md5hash'], dtfinal, x, y, z))
     con.commit()
@@ -313,7 +338,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
                                      description='This script will scan a folder and import EXIF metadata '
                                      'into a SpatiaLite database.')
-    parser.add_argument('scanpath', help='path to recursively scan for jpeg files')
+    parser.add_argument('scanpath', help='path to recursively scan for image files')
     parser.add_argument('-d', '--dbpath',
                         help='the path of the spatialite database to be created. Default: '
                              'scanpath/PhotoMetadata.sqlite')
@@ -331,6 +356,9 @@ if __name__ == "__main__":
                         help='overwrite an existing database given with --dbpath')
     parser.add_argument('-w', '--wipe', action='store_true',
                         help='wipe out values in an existing database before insert')
+    parser.add_argument('-g', '--geo', action='store_true',
+                        help='store lat/long data in EXIF metadata in a geometry enabled table. Requires that the '
+                             'SpatiaLite extension module be loadable.')
 
     args = parser.parse_args()
 
@@ -341,12 +369,13 @@ if __name__ == "__main__":
         log = None
     # initializes new sqlite database as spatialite database
     if not args.dbpath:
-        dbpath = os.path.join(args.scanpath, 'PhotoMetadata.sqlite')
+        dbpath = os.path.join(args.scanpath, 'images.sqlite')
     else:
         dbpath = args.dbpath
 
-    init_db(dbpath, args.overwrite)
-    create_tables(dbpath, args.wipe)
+    if args.geo:
+        init_db(dbpath, args.overwrite)
+    create_tables(dbpath=dbpath, wipe=args.wipe, geo=args.geo)
     results = capture_meta(path=args.scanpath, dbpath=dbpath, log=log, cores=args.cores, chunk_size=args.chunk_size,
                            local=args.local, multi=args.multi)
     # print(results)

@@ -163,3 +163,6 @@ vignettes/*.pdf
 *.utf8.md
 *.knit.md
 
+# custom
+temp.py
+

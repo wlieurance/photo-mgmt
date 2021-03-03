@@ -5,24 +5,29 @@ import os
 import re
 import csv
 import sys
-from time import sleep
+import random
 from datetime import datetime
 from pathlib import Path
 
 
-def rename_files(path, out_format=None, whitespace=None, level=None, match=None, expand=None, date_frmt='%Y%m%d_%H%M%S',
-                 split_dirs=None):
+def rename_files(dbpath, out_format=None, whitespace=None, level=None, match=None, expand=None,
+                 date_frmt='%Y%m%d_%H%M%S', split_dirs=None):
     new = []
-    conn = sqlite.connect(path)
-    conn.row_factory = sqlite.Row
-    c = conn.cursor()
-    sql = ("SELECT a.*,"
-           "       replace(substr(b.value, 1, instr(b.value, ' ')-1), ':', '-') ||"
-           "       ' ' || substr(b.value, instr(b.value, ' ')+1) dt_orig"
-           "  FROM photo a"
-           "  LEFT JOIN tag b ON a.md5hash = b.md5hash"
-           " WHERE b.tag = 'EXIF DateTimeOriginal'"
-           " ORDER BY a.path;")
+    con = sqlite.connect(dbpath)
+    con.row_factory = sqlite.Row
+    c = con.cursor()
+    sql = '\n'.join((
+        "SELECT a.*,",
+        "       replace(substr(b.value, 1, instr(b.value, ' ')-1), ':', '-') ||",
+        "       ' ' || substr(b.value, instr(b.value, ' ')+1) dt_orig,",
+        "       d.base_path",
+        "  FROM photo a",
+        "  LEFT JOIN tag b ON a.md5hash = b.md5hash",
+        "  LEFT JOIN hash c ON a.md5hash = c.md5hash",
+        "  LEFT JOIN import d ON c.import_date = d.import_date",
+        " WHERE b.tag = 'EXIF DateTimeOriginal'",
+        " ORDER BY a.path;"
+    ))
     print("Getting records from database...")
     rows = c.execute(sql).fetchall()
     i = 0
@@ -34,6 +39,7 @@ def rename_files(path, out_format=None, whitespace=None, level=None, match=None,
         vd['dt'] = datetime.strptime(row['dt_orig'], '%Y-%m-%d %H:%M:%S')
         vd['year'] = vd['dt'].year
         vd['month'] = vd['dt'].month
+        vd['old_base'] = row['base_path']
         vd['old_path'] = row['path']
         vd['old_dir'] = os.path.dirname(row['path'])
         vd['old_name'] = row['fname']
@@ -69,15 +75,16 @@ def rename_files(path, out_format=None, whitespace=None, level=None, match=None,
                 vd['new_dir'] = '/'.join((vd['new_dir'], vd['dt'].strftime('%Y')))
             elif split_dirs == 'month':
                 vd['new_dir'] = '/'.join((vd['new_dir'], vd['dt'].strftime('%Y/%b')))
+            vd['new_dir'] = re.sub('^/', '', vd['new_dir'])  # removes leading / in case of blank new_dir
 
         # process full path
         vd['new_path'] = '/'.join((vd['new_dir'], vd['new_name']))
+        vd['new_path'] = re.sub('^/', '', vd['new_path'])  # removes leading / in case of blank new_path
         if whitespace is not None:
             vd['new_path'] = re.sub(r'\s+', whitespace, vd['new_path'])
         new.append(vd)
         i += 1
-
-    conn.close()
+    con.close()
     return new
 
 
@@ -89,18 +96,18 @@ def write_test(out_path, out_dict):
             writer.writerow(name)
 
 
-def write_new(path, out_dict, base=''):
-    conn = sqlite.connect(path)
-    conn.row_factory = sqlite.Row
-    c = conn.cursor()
+def write_new(dbpath, out_dict, base=''):
+    con = sqlite.connect(dbpath)
+    con.row_factory = sqlite.Row
+    c = con.cursor()
     c.execute("DROP TABLE IF EXISTS rename;")
-    c.execute("CREATE TABLE rename (md5hash TEXT, new_path TEXT, old_path TEXT, old_name TEXT);")
-    isql = ("INSERT INTO rename (md5hash, new_path, old_path, old_name) VALUES "
-            "(:md5hash, :new_path, :old_path, :old_name);")
+    c.execute("CREATE TEMP TABLE rename (md5hash TEXT, new_path TEXT, old_base TEXT, old_path TEXT, old_fname TEXT);")
+    isql = ("INSERT INTO rename (md5hash, old_base, new_path, old_path, old_fname) VALUES "
+            "(:md5hash, :old_base, :new_path, :old_path, :old_name);")
     c.executemany(isql, out_dict)
-    conn.commit()
+    con.commit()
 
-    # deal with duplicate paths
+    # deal with duplicate paths by adding row numbers to duplicates according to the original filesystem order
     dup_base_sql = os.linesep.join((
         "WITH dups AS (",
         "SELECT new_path, count(md5hash) n",
@@ -116,27 +123,39 @@ def write_new(path, out_dict, base=''):
         ")",
         "",
     ))
+    # get the max row number for 0 padding purposes so files sort correctly in the filesystem
     max_rn_sql = os.linesep.join((dup_base_sql, "SELECT max(rn) n FROM row_ordered;"))
-    rn_sql = os.linesep.join((dup_base_sql, "SELECT * FROM row_ordered;"))
     max_n = c.execute(max_rn_sql).fetchone()['n']
     digits = len(str(max_n))
+
+    rn_sql = os.linesep.join((dup_base_sql, "SELECT * FROM row_ordered;"))
     rows = c.execute(rn_sql).fetchall()
-    u = conn.cursor()
+    u = con.cursor()
     for row in rows:
         new_path = row['new_path']
         rn = str(row['rn']).rjust(digits, '0')
         altered_path = ''.join((os.path.splitext(new_path)[0], '-', rn, os.path.splitext(new_path)[1]))
         u.execute('UPDATE rename SET new_path = ? WHERE md5hash = ? AND new_path = ?;',
                   (altered_path, row['md5hash'], new_path))
-    conn.commit()
+    con.commit()
 
-    # rename and move
+    # post-duplicate check, do move/rename and database update
     print('Beginning renaming process...')
+    import_date = datetime.utcnow().isoformat(sep='T', timespec='seconds') + 'Z'
+    if base == '':
+        base_path = None
+        local = False
+    else:
+        base_path = re.sub(r'\\', '/', base)
+        local = True
+    c.execute("INSERT OR IGNORE INTO import (import_date, base_path, local, type) VALUES (?,?,?, 'rename')",
+              (import_date, base_path, local))
+    con.commit()
     rows = c.execute("SELECT * FROM rename;").fetchall()
     i = 0  # for progressbar
     n = len(rows)  # for progressbar
     for row in rows:
-        old_fullpath = os.path.abspath(os.path.join(base, row['old_path']))
+        old_fullpath = os.path.abspath(os.path.join(row['old_base'], row['old_path']))
         new_fullpath = os.path.abspath(os.path.join(base, row['new_path']))
         # print('Renaming', old_fullpath, 'to', new_fullpath)
         try:
@@ -147,7 +166,9 @@ def write_new(path, out_dict, base=''):
         else:
             u.execute('UPDATE photo SET path = ?, fname = ? WHERE md5hash = ? AND path = ?;',
                       (row['new_path'], os.path.basename(row['new_path']), row['md5hash'], row['old_path']))
-            conn.commit()
+            u.execute('UPDATE hash SET import_date = ? WHERE md5hash = ?;',
+                      (import_date, row['md5hash']))
+            con.commit()
 
         # progressbar
         # https://stackoverflow.com/questions/3002085/python-to-print-out-status-bar-and-percentage
@@ -156,7 +177,8 @@ def write_new(path, out_dict, base=''):
         sys.stdout.write("[%-20s] %d%%" % ('=' * int(20 * j), 100 * j))
         sys.stdout.flush()
         i += 1
-    conn.close()
+    print(os.linesep)
+    con.close()
 
 
 def remove_empty_dir(path):
@@ -192,13 +214,37 @@ def delete_empty(path):
             remove_empty_dir(dirpath)
 
 
+def confirm_write(out_dict, new_base=None):
+    print("### RENAMED EXAMPLES ###\n")
+    print_list = random.sample(out_dict, 5)
+    for e in print_list:
+        print('old dbpath:', e['old_path'].replace('/', os.path.sep))
+        print('new dbpath:', e['new_path'].replace('/', os.path.sep))
+        if e['old_base']:
+            print('old file path:', os.path.join(e['old_base'], e['old_path']).replace('/', os.path.sep))
+        if new_base:
+            print('new file path:', os.path.join(new_base, e['new_path']).replace('/', os.path.sep))
+        else:
+            print('new file path:', e['new_path'].replace('/', os.path.sep))
+        print(os.linesep)
+    ask = input("Are you sure you want to rename/move files with these changes? (y/n): ")
+    if ask:
+        if ask[0].lower() == 'y':
+            go = True
+        else:
+            go = False
+    else:
+        go = False
+    return go
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
                                      description='This script will rename photos according to specific criteria while '
                                                  'and update them in the database.')
-    parser.add_argument('dbpath', help='The path of the spatialite database to be created.')
+    parser.add_argument('dbpath', help='The path of the spatialite database to be created with the scan_photos module.')
     parser.add_argument('-b', '--base', help='The base path for the photos, in the case that only relative file paths '
-                                             'are stored in the db.')
+                                             'are to be stored in the db.')
     parser.add_argument('-l', '--level', help='The level to flatten the directory structure. 0 will remove all '
                                               'sub-folders, 1 will keep first level of sub-folders, etc.',
                         type=int)
@@ -213,8 +259,7 @@ if __name__ == "__main__":
                         default='%Y%m%d_%H%M%S')
     parser.add_argument('-s', '--rename_string', help='The format for the new filename. Users can use the following '
                                                       'tags in the string: {regex} {timestamp}, {year}, {month}, '
-                                                      '{isoyear}, {isoweek}, {isoday}, {old_name}, {hash}',
-                        default='{old_name}')
+                                                      '{isoyear}, {isoweek}, {isoday}, {old_name}, {md5hash}')
     parser.add_argument('-t', '--test', help='A file path in which to export the new file paths/names. Choosing this '
                                              'option will not make any changes to the database or the photo file '
                                              'structure.')
@@ -225,21 +270,22 @@ if __name__ == "__main__":
     parser.add_argument('-e', '--delete_empty', help='Delete empty folders after the renaming process.',
                         action='store_true')
 
-    args = parser.parse_args([r'G:\GIS\Photos\trailcam\CA\PhotoMetadata.sqlite', '-b', r'G:\GIS\Photos\trailcam\CA',
-                              '-l', '1', '-r', r'([^/\\]+)', '-R', r'\1', '-s', '{regex}_{timestamp}', '-t',
-                              r'C:\Users\wlieurance\Documents\temp\rename.csv', '-w', '', '-T', 'year', '-e'])
     args = parser.parse_args()
 
-    new_names = rename_files(path=args.dbpath, level=args.level, match=args.match,
+    new_names = rename_files(dbpath=args.dbpath, level=args.level, match=args.match,
                              whitespace=args.whitespace, expand=args.expand, date_frmt=args.date_format,
                              split_dirs=args.time_subdirs, out_format=args.rename_string)
-    if args.test is not None:
+
+    if args.test is None:
+        go = confirm_write(out_dict=new_names, new_base=args.base)
+        if go:
+            write_new(dbpath=args.dbpath, out_dict=new_names, base=args.base)
+            if args.delete_empty and args.base is not None:
+                delete_empty(args.base)
+        else:
+            print('Skipping rename/move and database update.')
+    else:
         print('Writing test output to', args.test)
         write_test(out_path=args.test, out_dict=new_names)
-    else:
-        write_new(dbpath=args.dbpath, out_dict=new_names, base=args.base)
-
-    if args.delete_empty and args.base is not None:
-        delete_empty(args.base)
 
     print('Script finished.')

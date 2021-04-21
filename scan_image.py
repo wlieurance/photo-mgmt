@@ -60,7 +60,7 @@ def chunks(l, n):
         yield l[i:i + n]
 
 
-def read_file(root, f):
+def read_file(root, f, thumb=False):
     error = False
     tags, md5checksum, uid, ftype, msg, kv_list = [None]*6
     try:
@@ -99,6 +99,9 @@ def read_file(root, f):
         kv_list = []
         for key, value in tags.items():
             # print(key, value)
+            if 'thumb' in str(key.lower()) and not thumb:
+                # print("bad key:", key)
+                continue  # allows skipping thumbnail data for size reduction
             if isinstance(value, bytes):
                 # # following code unusable in multiprocessing (or pathos use) due to attempted pickling of the
                 # # sqlite.Binary(value) resulting in an error. The conversion has been passed off to right before
@@ -203,7 +206,7 @@ def write_results(results, local, dbpath, path, import_date, log):
     con.close()
 
 
-def capture_meta(path, dbpath, log, cores, chunk_size, local=False, multi=False):
+def capture_meta(path, dbpath, log, cores, chunk_size, local=False, multi=False, thumb=False):
     # insert import data
     import_date = datetime.utcnow().isoformat(sep='T', timespec='seconds') + 'Z'
     con = sqlite.connect(dbpath)
@@ -220,7 +223,7 @@ def capture_meta(path, dbpath, log, cores, chunk_size, local=False, multi=False)
         log.write('\nstarting capture_meta function at: ' + str(datetime.now()) + 'with multi=' + str(multi) +'\n')
     inputs = []
     for root, dirs, files in os.walk(path):
-        inputs += [(root, f) for f in files]
+        inputs += [(root, f, thumb) for f in files]
     chunked = chunks(inputs, chunk_size)  # create smaller lists to feed into the processor
     file_length = len(inputs)
     chunk_count = 0
@@ -232,15 +235,15 @@ def capture_meta(path, dbpath, log, cores, chunk_size, local=False, multi=False)
         try:
             for chunk in chunked:
                 chunk_count += len(chunk)
-                print("current chunk @", os.path.sep.join(chunk[0]))
+                print("current chunk @", os.path.sep.join(chunk[0][0:2]))
                 if multi:
                     with mp.Pool(processes=min([mp.cpu_count()-cores, 1])) as pool:
                         results = pool.starmap(read_file, chunk)
                 else:
-                    for root, f in chunk:
+                    for root, f, t in chunk:
                         # print("Processing ", os.path.join(root, f))
                         if os.path.splitext(f)[1] not in ['.sqlite-journal']:
-                            res = read_file(root, f)
+                            res = read_file(root, f, t)
                             results.append(res)
                 # insert results into the database. SQLite concurrency locks do not allow this during multiprocessing.
                 # WAL logging can be enabled but currently inserts are very fast so multiprocessing with inserts was not
@@ -356,6 +359,8 @@ if __name__ == "__main__":
                         help='overwrite an existing database given with --dbpath')
     parser.add_argument('-w', '--wipe', action='store_true',
                         help='wipe out values in an existing database before insert')
+    parser.add_argument('-t', '--thumb', action='store_true',
+                        help='store EXIF thumbnail (as BLOB) and related tags in the database.')
     parser.add_argument('-g', '--geo', action='store_true',
                         help='store lat/long data in EXIF metadata in a geometry enabled table. Requires that the '
                              'SpatiaLite extension module be loadable.')
@@ -377,7 +382,7 @@ if __name__ == "__main__":
         init_db(dbpath, args.overwrite)
     create_tables(dbpath=dbpath, wipe=args.wipe, geo=args.geo)
     results = capture_meta(path=args.scanpath, dbpath=dbpath, log=log, cores=args.cores, chunk_size=args.chunk_size,
-                           local=args.local, multi=args.multi)
+                           local=args.local, multi=args.multi, thumb=args.thumb)
     # print(results)
     convert_gis(dbpath, log)
 

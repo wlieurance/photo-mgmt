@@ -116,10 +116,10 @@ def read_file(root, f, thumb=False):
             else:
                 try:
                     fieldtype = exifread.FIELD_TYPES[value.field_type]
-                    if key == 'EXIF MakerNote' or fieldtype[2] == 'Proprietary':
+                    if 'Maker' in key or fieldtype[2] == 'Proprietary':
                         v = str(value.values)
                     else:
-                        v = value.printable
+                        v = str(value.printable)
                 except:
                     print("could not convert", key, "to usable value.")
                     v = None
@@ -172,7 +172,7 @@ def create_tables(dbpath, wipe, geo):
     con.close()
 
 
-def write_results(results, local, dbpath, path, import_date, log):
+def write_results(results, local, dbpath, path, import_date, log, verbose=False):
     print("writing results to database...")
     con = sqlite.connect(dbpath)
     con.row_factory = sqlite.Row
@@ -187,7 +187,8 @@ def write_results(results, local, dbpath, path, import_date, log):
             if local:
                 ins_path = re.sub(r'^(\\|/)', '', ins_path.replace(path, ''))
             ins_path = ins_path.replace('\\', '/')  # standardizes path output across multiple os's
-            # print(ins_path, r['fname'], r['ftype'], r['hash'], import_date)
+            if verbose:
+                print(ins_path, r['fname'], r['ftype'], r['hash'], import_date)
             c.execute(hash_sql, (r['hash'], import_date))
             c.execute(photo_sql, (ins_path, r['fname'], r['ftype'], r['hash']))
             con.commit()
@@ -197,7 +198,8 @@ def write_results(results, local, dbpath, path, import_date, log):
                         val = sqlite.Binary(t['value'])
                     else:
                         val = t['value']
-                    # print(r['hash'], t['name'], val)
+                    if verbose:
+                        print('\t', r['hash'], t['name'], val)
                     c.execute('INSERT OR IGNORE INTO tag (md5hash, tag, value) VALUES (?,?,?);',
                               (r['hash'], t['name'], val,))
                 con.commit()

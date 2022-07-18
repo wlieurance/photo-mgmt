@@ -5,7 +5,14 @@ Tools used for photo management.
 Users will need [Python 3](https://www.python.org/) for the python script and [R](https://www.r-project.org/) for the R script
 For the python script please use pip and the distributed requirements.txt file. 
 
+## Python
+The source files are organized as a python package so that you can just install as a python package if so desired:
+`pip install --user git+https://github.com/wlieurance/photo-mgmt`
+
+Alternatively you can just clone the source from the repository, navigate to the source directory, and use the scripts directly:
+
 `pip3 install -r requirements.txt`
+`cd src/photo-mgmt`
 
 You will also need to install the [spatialite extension module](https://www.gaia-gis.it/fossil/libspatialite/index) *(mod_spatialite)* and add it to your system path if you want geometry support.
 

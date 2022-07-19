@@ -8,16 +8,17 @@ import argparse
 import multiprocessing as mp
 import sqlite3 as sqlite
 import psycopg
+import psycopg.rows
 import pytz
 import json
 import base64
-from psycopg.rows import dict_row
 from collections.abc import Collection, Reversible
 from typing import Union, TextIO, Generator, Tuple
 from getpass import getpass
 from datetime import datetime
 from operator import itemgetter
 from fuzzywuzzy import fuzz
+from create_db import init_db, get_pg_con, get_sqlite_con, create_tables
 
 # Necessary to fix bad detections of jpegs in imghdr.
 # See https://stackoverflow.com/questions/36870661/imghdr-python-cant-detec-type-of-some-images-image-extension
@@ -210,170 +211,6 @@ def read_file(root: str, f: str, thumb: bool = False, maker: bool = False, updat
             'tags': tags}
 
 
-def init_db(dbpath: str, overwrite: bool):
-    """
-    Creates a new spatialite database.
-
-    :param dbpath: character string. The file path where the new database is to be created.
-    :param overwrite: Boolean. Overwrite the database if dbpath already exists.
-    """
-    if os.path.isfile(dbpath) and overwrite:
-        try:
-            os.remove(dbpath)
-            print('Database deleted')
-        except FileNotFoundError:
-            print('No database to delete.')
-    db_exists = os.path.isfile(dbpath)
-    con = sqlite.connect(dbpath)
-    con.execute('pragma journal_mode=WAL;')  # turns on 'write ahead logging' for concurrent writing.
-    if not db_exists:
-        print('Initializing Spatialite...')
-        con.enable_load_extension(True)
-        con.execute("SELECT load_extension('mod_spatialite')")
-        con.execute("SELECT InitSpatialMetaData(1)")
-        print('Spatial database initialized.')
-    con.close()
-
-
-def get_pg_con(user: str, database: str, password: str = None, host: str = 'localhost',
-               port: int = 5432) -> psycopg.Connection:
-    """
-    Connects to a PostgreSQL instance and returns the connection for further use.
-
-    :param user: character string. The database username.
-    :param database: character string. The database name.
-    :param password: character string. The password for the user.
-    :param host: character string. The hostname, DNS name or IP address of the PG instance.
-    :param port: integer. The port to connect through.
-    :return: A psycopg2 connection object.
-    """
-    con = psycopg.connect(user=user, password=password, host=host, port=port, dbname=database,
-                          row_factory=dict_row)
-    return con
-
-
-def get_sqlite_con(dbpath: str, geo: bool = False) -> sqlite.Connection:
-    """
-    Connects to a SQLite database and returns the connection for further use.
-
-    :param dbpath: character string. The file path to an existing SQLite database.
-    :param geo: Boolean. Is the SQLite database also a Spatialite database.
-    :return: A sqlite3 connection object.
-    """
-    con = sqlite.connect(dbpath)
-    con.row_factory = sqlite.Row
-    con.execute("PRAGMA foreign_keys = ON;")
-    if geo:
-        con.enable_load_extension(True)
-        con.execute("SELECT load_extension('mod_spatialite')")
-    return con
-
-
-def create_tables(con: Union[sqlite.Connection, psycopg.Connection], wipe: bool, geo: bool, con_type: str,
-                  verbose: bool = False):
-    """
-    Creates the tables if they do not exist in the database.
-
-    :param con: Either a sqlite3 or a psycopg2 connection object.
-    :param wipe: Boolean. Should the database be wiped clean of existing data?
-    :param geo: Boolean. Should the database contain geometry data harvested from EXIF metadata?
-    :param con_type: character string. Either 'sqlite' or 'postgres'. This tells the function which connection type
-    it is using.
-    :param verbose: Boolean. Should the function print out each sql statement before executing it (for debugging)?
-    """
-    c = con.cursor()
-
-    # tables
-    if con_type == 'sqlite':
-        sql_list = [
-            '\n'.join((
-                'CREATE TABLE IF NOT EXISTS import (',
-                '   import_date DATETIME PRIMARY KEY, base_path TEXT, local BOOLEAN, type TEXT);')),
-            'CREATE TABLE IF NOT EXISTS hash (md5hash TEXT PRIMARY KEY);',
-            '\n'.join((
-                'CREATE TABLE IF NOT EXISTS photo (',
-                '   path TEXT PRIMARY KEY, fname TEXT, ftype TEXT, md5hash TEXT,',
-                '   dt_orig DATETIME, dt_mod DATETIME, dt_import DATETIME,',
-                '   FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE,',
-                '   FOREIGN KEY (dt_import) REFERENCES import(import_date) ON DELETE CASCADE ON UPDATE CASCADE);')),
-            '\n'.join((
-                'CREATE TABLE IF NOT EXISTS tag (',
-                '   md5hash TEXT, meta JSON, PRIMARY KEY (md5hash),',
-                '   FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE);'))
-        ]
-        for sql in sql_list:
-            if verbose:
-                print(sql)
-            con.execute(sql)
-
-        # geometry
-        if geo:
-            geo_sql = '\n'.join((
-                'CREATE TABLE IF NOT EXISTS location (',
-                '   md5hash TEXT PRIMARY KEY, fname TEXT, path TEXT, lat NUMERIC, long NUMERIC, elev_m NUMERIC,',
-                '   FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE);'))
-            if verbose:
-                print(geo_sql)
-            con.execute(geo_sql)
-            con.execute("SELECT load_extension('mod_spatialite')")
-            rows = c.execute("PRAGMA table_info('location');")
-            headers = []
-            for row in rows:
-                headers.append(row[1])
-            if 'geometry' not in headers:
-                c.execute("SELECT AddGeometryColumn('location', 'geometry', 4326, 'POINTZ', 'XYZ');")
-    elif con_type == 'postgres':
-        # tables
-        sql_list = [
-            '\n'.join((
-                'CREATE TABLE IF NOT EXISTS import (',
-                '   import_date TIMESTAMP WITH TIME ZONE PRIMARY KEY,',
-                '   base_path TEXT, local BOOLEAN, type VARCHAR);')),
-            'CREATE TABLE IF NOT EXISTS hash (md5hash UUID PRIMARY KEY);',
-            '\n'.join((
-                'CREATE TABLE IF NOT EXISTS photo (',
-                '   path VARCHAR PRIMARY KEY, fname VARCHAR, ftype VARCHAR, md5hash UUID,',
-                '   dt_orig TIMESTAMP WITH TIME ZONE, dt_mod TIMESTAMP, dt_import TIMESTAMP WITH TIME ZONE,',
-                '   FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE,',
-                '   FOREIGN KEY (dt_import) REFERENCES import(import_date) ON DELETE CASCADE ON UPDATE CASCADE);')),
-            '\n'.join((
-                'CREATE TABLE IF NOT EXISTS tag (',
-                '   md5hash UUID, meta JSONB, PRIMARY KEY (md5hash),',
-                '   FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE);'))
-        ]
-        for sql in sql_list:
-            if verbose:
-                print(sql)
-            c.execute(sql)
-        # geometry
-        if geo:
-            geo_list = [
-                'CREATE EXTENSION IF NOT EXISTS postgis;',
-                '\n'.join((
-                    'CREATE TABLE IF NOT EXISTS location (md5hash UUID PRIMARY KEY, fname VARCHAR, path VARCHAR,',
-                    '   lat DOUBLE PRECISION, long DOUBLE PRECISION, elev_m DOUBLE PRECISION, geom GEOMETRY,',
-                    '   FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE);')),
-                "CREATE INDEX IF NOT EXISTS location_geom_gix ON location USING gist(geom);"
-            ]
-            for gsql in geo_list:
-                if verbose:
-                    print(gsql)
-                c.execute(gsql)
-    else:
-        raise ValueError("con_type must be either 'postgres' or 'sqlite'.")
-    if wipe:
-        c.execute('DELETE FROM tag;')
-        c.execute('DELETE FROM photo;')
-        c.execute('DELETE FROM location;')
-        c.execute('DELETE FROM hash;')
-        c.execute('DELETE FROM import;')
-
-    # indices
-    c.execute("CREATE INDEX IF NOT EXISTS photo_md5hash_idx ON photo (md5hash);")
-    # c.execute("CREATE INDEX IF NOT EXISTS tag_value_idx ON tag (value);")
-    con.commit()
-
-
 def make_serializable(tags: dict) -> str:
     """
     This function converts objects stored as exifread dictionary to a json serializable dictionary.
@@ -502,7 +339,7 @@ def capture_meta(path: str, con: Union[sqlite.Connection, psycopg.Connection], c
                  cores: int, chunk_size: int, local: bool = False, multi: bool = False, thumb: bool = False,
                  maker: bool = False, update: bool = False) -> \
         Tuple[list[dict[str, str, str, str, datetime, str, dict]],
-              list[dict[str, str]], dict[float | int, float | int, int]]:
+              list[dict[str, str]], dict[Union[float, int], Union[float, int], int]]:
     """
     Scans a path for photos and extracts EXIF metadata as well as other file information.
 
@@ -742,8 +579,8 @@ if __name__ == "__main__":
     args_pg.add_argument('--user', default='postgres')
     args_pg.add_argument('--port', default=5432, type=int)
     args_pg.add_argument('--passwd', help="Password for user.")
-    args_pg.add_argument('--pass_ask', action='store_true',
-                         help="User will be prompted for password if none given.")
+    args_pg.add_argument('--noask', action='store_true',
+                         help="User will not be prompted for password if none given.")
     parser.add_argument('-l', '--logpath',
                         help='the path of the log file to be generated.')
     parser.add_argument('-c', '--cores', type=int,
@@ -787,7 +624,7 @@ if __name__ == "__main__":
         conn = get_sqlite_con(dbpath=args.dbpath, geo=args.geo)
     else:
         ctype = 'postgres'
-        if args.passwd is None and args.pass_ask:
+        if args.passwd is None and not args.noask:
             args.passwd = getpass()
         conn = get_pg_con(user=args.user, database=args.db, password=args.passwd, host=args.host, port=args.port)
     if not args.update:

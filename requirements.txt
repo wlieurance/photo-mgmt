@@ -2,3 +2,4 @@ ExifRead>=2.3.2
 fuzzywuzzy
 python-Levenshtein
 pytz
+psycopg>=3

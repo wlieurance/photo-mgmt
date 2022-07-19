@@ -118,6 +118,7 @@ def match_template(image, template):
     return cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
 
 
+
 def convert_date(dt_str):
     """
     Converts a date time read from a phenocam stamp on an image and converts it to an iso formatted string.
@@ -140,6 +141,7 @@ def convert_date(dt_str):
         return None
     else:
         return dtp.isoformat(sep=' ')
+
 
 
 def read_photos(dirpath):

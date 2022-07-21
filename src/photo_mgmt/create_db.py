@@ -45,8 +45,12 @@ def get_pg_con(user: str, database: str, password: str = None, host: str = 'loca
     :param port: integer. The port to connect through.
     :return: A psycopg2 connection object.
     """
-    con = psycopg.connect(user=user, password=password, host=host, port=port, dbname=database,
-                          row_factory=psycopg.rows.dict_row)
+    if password:
+        con = psycopg.connect(user=user, password=password, host=host, port=port, dbname=database,
+                              row_factory=psycopg.rows.dict_row)
+    else:
+        con = psycopg.connect(user=user, port=port, dbname=database,
+                              row_factory=psycopg.rows.dict_row)
     return con
 
 
@@ -67,22 +71,20 @@ def get_sqlite_con(dbpath: str, geo: bool = False) -> sqlite.Connection:
     return con
 
 
-def create_tables(con: Union[sqlite.Connection, psycopg.Connection], wipe: bool, geo: bool, con_type: str,
-                  verbose: bool = False):
+def create_tables(con: Union[sqlite.Connection, psycopg.Connection], wipe: bool = False,
+                  geo: bool = False, verbose: bool = False):
     """
     Creates the tables if they do not exist in the database.
 
     :param con: Either a sqlite3 or a psycopg2 connection object.
     :param wipe: Boolean. Should the database be wiped clean of existing data?
     :param geo: Boolean. Should the database contain geometry data harvested from EXIF metadata?
-    :param con_type: character string. Either 'sqlite' or 'postgres'. This tells the function which connection type
-    it is using.
     :param verbose: Boolean. Should the function print out each sql statement before executing it (for debugging)?
     """
     c = con.cursor()
 
     # tables
-    if con_type == 'sqlite':
+    if isinstance(con, sqlite.Connection):
         sql_list = [
             '\n'.join((
                 'CREATE TABLE IF NOT EXISTS import (',
@@ -120,7 +122,7 @@ def create_tables(con: Union[sqlite.Connection, psycopg.Connection], wipe: bool,
                 headers.append(row[1])
             if 'geometry' not in headers:
                 c.execute("SELECT AddGeometryColumn('location', 'geometry', 4326, 'POINTZ', 'XYZ');")
-    elif con_type == 'postgres':
+    elif isinstance(con, psycopg.Connection):
         # tables
         sql_list = [
             '\n'.join((
@@ -149,7 +151,8 @@ def create_tables(con: Union[sqlite.Connection, psycopg.Connection], wipe: bool,
                 'CREATE EXTENSION IF NOT EXISTS postgis;',
                 '\n'.join((
                     'CREATE TABLE IF NOT EXISTS location (md5hash UUID PRIMARY KEY, fname VARCHAR, path VARCHAR,',
-                    '   lat DOUBLE PRECISION, long DOUBLE PRECISION, elev_m DOUBLE PRECISION, geom GEOMETRY,',
+                    '   lat DOUBLE PRECISION, long DOUBLE PRECISION, elev_m DOUBLE PRECISION, ',
+                    '   geom GEOMETRY(POINTZ, 4326),',
                     '   FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE);')),
                 "CREATE INDEX IF NOT EXISTS location_geom_gix ON location USING gist(geom);"
             ]
@@ -158,7 +161,7 @@ def create_tables(con: Union[sqlite.Connection, psycopg.Connection], wipe: bool,
                     print(gsql)
                 c.execute(gsql)
     else:
-        raise ValueError("con_type must be either 'postgres' or 'sqlite'.")
+        raise ValueError("con must be either class psycopg.Connection or sqlite3.Connection.")
     if wipe:
         c.execute('DELETE FROM tag;')
         c.execute('DELETE FROM photo;')
@@ -174,13 +177,11 @@ def create_tables(con: Union[sqlite.Connection, psycopg.Connection], wipe: bool,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-                                     description='This script will scan a folder and import EXIF metadata '
-                                     'into a SpatiaLite database.')
-    parser.add_argument('scanpath', help='path to recursively scan for image files')
+                                     description='This script will initialize a photo management database as either an SQLite'
+                                                  ' or a PostgreSQL database.')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--dbpath',
-                       help='the path of the spatialite database to be created. Default: '
-                            'scanpath/images.sqlite')
+                       help='the path of the spatialite database to be created.')
     group.add_argument('--db', help='the PostgreSQL database to which to connect.')
     args_pg = parser.add_argument_group('PostgreSQL')
     args_pg.add_argument('--host', default='localhost')
@@ -213,6 +214,7 @@ if __name__ == "__main__":
         if args.passwd is None and not args.noask:
             args.passwd = getpass()
         conn = get_pg_con(user=args.user, database=args.db, password=args.passwd, host=args.host, port=args.port)
-    if not args.update:
-        create_tables(con=conn, wipe=args.wipe, geo=args.geo, con_type=ctype)
+    create_tables(con=conn, wipe=args.wipe, geo=args.geo)        
+    conn.close()
+    conn = None
     print("Script finished.")

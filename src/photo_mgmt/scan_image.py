@@ -81,21 +81,6 @@ def convert_snum_array(arg: str) -> list[float]:
             arg_float.append(float_a)
         else:
             arg_float.append(None)
-    # # original code
-    # for x in range(0, len(a)):
-    #     for y in range(0, len(a[x])):
-    #         try:
-    #             if y == 0:
-    #                 div = int(a[x][y])
-    #             else:
-    #                 try:
-    #                     div /= int(a[x][y])
-    #                 except ZeroDivisionError:
-    #                     div = 0
-    #         except ValueError:
-    #             div = r'/'.join(a[x])
-    #             break
-    #     b.append(div)
     return arg_float
 
 
@@ -183,30 +168,6 @@ def read_file(root: str, f: str, thumb: bool = False, maker: bool = False, updat
                 # print(msg)
             ts_mod = os.path.getmtime(os.path.join(root, f))
             dt_mod = datetime.fromtimestamp(ts_mod).strftime('%Y-%m-%d %H:%M:%S')
-    # deprecated code section for storing tags as individual string records instead of json.
-    # if tags:
-    #     kv_list = []
-    #     for key, value in tags.items():
-    #         # print(key, value)
-    #         if 'thumb' in str(key.lower()) and not thumb:
-    #             # print("bad key:", key)
-    #             continue  # allows skipping thumbnail data for size reduction
-    #         if isinstance(value, bytes):
-    #             v = value
-    #             bin_val = True
-    #         else:
-    #             try:
-    #                 fieldtype = exifread.classes.FIELD_TYPES[value.field_type]
-    #                 if 'Maker' in key or fieldtype[2] == 'Proprietary':
-    #                     v = str(value.values)
-    #                 else:
-    #                     v = str(value.printable)
-    #             except:
-    #                 print("could not convert", key, "to usable value.")
-    #                 v = None
-    #             bin_val = False
-    #         if v is not None:
-    #             kv_list.append({'name': key, 'value': v, 'b': bin_val})
     return {'root': root, 'fname': f, 'ftype': ftype, 'hash': md5checksum, 'dt_mod': dt_mod, 'msg': msg,
             'tags': tags}
 
@@ -247,7 +208,7 @@ def make_serializable(tags: dict) -> str:
 
 
 def write_results(results: list[dict], local: bool, con: Union[sqlite.Connection, psycopg.Connection],
-                  con_type: str, path: str, import_date: str, log: TextIO = None, verbose: bool = False,
+                  path: str, import_date: str, log: TextIO = None, verbose: bool = False,
                   update_path: bool = False, updated: list[dict[str, str]] = None) -> list[dict[str, str]]:
     """
     Writes a list of  dictionary result from read_file function to the database.
@@ -255,8 +216,6 @@ def write_results(results: list[dict], local: bool, con: Union[sqlite.Connection
     :param results: dictionary. Produced from the read_file function.
     :param local: Boolean. Should file paths be stored relative to the scanned directory?
     :param con: Either a sqlite3 or a psycopg2 connection object.
-    :param con_type: character string. Either 'sqlite' or 'postgres'. This tells the function which connection type
-    it is using.
     :param path: character string. The directory path which was scanned for photos.
     :param import_date: character string. The datetime in UTC string iso format (e.g. YYYY-MM-DDTHH:MM:SSZ). This should
     be the datetime the import started, so it is the same for every record from the same import.
@@ -268,16 +227,16 @@ def write_results(results: list[dict], local: bool, con: Union[sqlite.Connection
     (photos with the same hash) have been updated.
     :return: A list of dictionaries in the format of {'old_path': character string, 'new_path': character string}.
     """
-    if con_type == 'postgres':
+    if isinstance(con, psycopg.Connection):
         ph = '%s'  # placeholder for sql parameter substitution
         ignore = ''
         conflict = 'ON CONFLICT DO NOTHING'
-    elif con_type == 'sqlite':
+    elif isinstance(con, sqlite.Connection):
         ph = '?'
         ignore = 'OR IGNORE'
         conflict = ''
     else:
-        raise ValueError("con_type must be either 'postgres' or 'sqlite'.")
+        raise ValueError("con must be either class psycopg.Connection or sqlite3.Connection.")
     if not updated:
         updated = []
     print("writing results to database...")
@@ -318,13 +277,6 @@ def write_results(results: list[dict], local: bool, con: Union[sqlite.Connection
                             updated.append({'old_path': path, 'new_path': ins_path})
             con.commit()
             if r['tags']:
-                # for t in r['tags']:
-                #     if t['b']:
-                #         val = sqlite.Binary(t['value'])
-                #     else:
-                #         val = t['value']
-                #     if verbose:
-                #         print('\t', r['hash'], t['name'], val)
                 if verbose:
                     print("inserting tags...")
                 c.execute(f'INSERT {ignore} INTO tag (md5hash, meta) VALUES ({ph},{ph}) {conflict};',
@@ -335,7 +287,7 @@ def write_results(results: list[dict], local: bool, con: Union[sqlite.Connection
     return updated
 
 
-def capture_meta(path: str, con: Union[sqlite.Connection, psycopg.Connection], con_type: str, log: TextIO,
+def capture_meta(path: str, con: Union[sqlite.Connection, psycopg.Connection], log: TextIO,
                  cores: int, chunk_size: int, local: bool = False, multi: bool = False, thumb: bool = False,
                  maker: bool = False, update: bool = False) -> \
         Tuple[list[dict[str, str, str, str, datetime, str, dict]],
@@ -345,8 +297,6 @@ def capture_meta(path: str, con: Union[sqlite.Connection, psycopg.Connection], c
 
     :param path: character string. The directory path which was scanned for photos.
     :param con: Either a sqlite3 or a psycopg2 connection object.
-    :param con_type: character string. Either 'sqlite' or 'postgres'. This tells the function which connection type
-    it is using.
     :param log: text I/O stream. A text file opened in write mode.
     :param cores: integer. The number of cpu cores to use when multiprocessing.
     :param chunk_size: integer.  The number of photos to process at one time (read then write).
@@ -358,16 +308,16 @@ def capture_meta(path: str, con: Union[sqlite.Connection, psycopg.Connection], c
     found?
     :return: A list of the 'read' results, a list of the 'write' results, and the execution time of the function.
     """
-    if con_type == 'postgres':
+    if isinstance(con, psycopg.Connection):
         ph = '%s'  # placeholder for sql parameter substitution
         ignore = ''
         conflict = 'ON CONFLICT DO NOTHING'
-    elif con_type == 'sqlite':
+    elif isinstance(con, sqlite.Connection):
         ph = '?'
         ignore = 'OR IGNORE'
         conflict = ''
     else:
-        raise ValueError("con_type must be either 'postgres' or 'sqlite'.")
+        raise ValueError("con must be either class psycopg.Connection or sqlite3.Connection.")
     # insert import data
     import_date = datetime.utcnow().isoformat(sep='T', timespec='seconds') + 'Z'
     c = con.cursor()
@@ -412,7 +362,7 @@ def capture_meta(path: str, con: Union[sqlite.Connection, psycopg.Connection], c
                 # pursued
                 read_time = datetime.now() - read_start
                 write_start = datetime.now()
-                updated = write_results(results=results, local=local, con=con, con_type=con_type, path=path,
+                updated = write_results(results=results, local=local, con=con, path=path,
                                         import_date=import_date, log=log, update_path=update, updated=updated)
                 write_time = datetime.now() - write_start
                 pct_complete = round((chunk_count / file_length) * 100, 1)
@@ -436,30 +386,28 @@ def capture_meta(path: str, con: Union[sqlite.Connection, psycopg.Connection], c
     return results, updated, exec_time
 
 
-def convert_gis(con: Union[sqlite.Connection, psycopg.Connection], con_type: str, log: TextIO = None):
+def convert_gis(con: Union[sqlite.Connection, psycopg.Connection], log: TextIO = None):
     """
     Converts gis data stored in EXIF metadata tags to database geometry records.
 
     :param con: Either a sqlite3 or a psycopg2 connection object.
-    :param con_type: character string. Either 'sqlite' or 'postgres'. This tells the function which connection type
-    it is using.
     :param log: text I/O stream. A text file opened in write mode.
     """
     gis_start = datetime.now()
-    if con_type == 'postgres':
+    if isinstance(con, psycopg.Connection):
         ph = '%s'
         geom = 'geom'
         p = 'ST_PointZ'
         ignore = ''
         conflict = 'ON CONFLICT DO NOTHING'
-    elif con_type == 'sqlite':
+    elif isinstance(con, sqlite.Connection):
         ph = '?'
         geom = 'geometry'
         p = 'MakePointZ'
         ignore = 'OR IGNORE'
         conflict = ''
     else:
-        raise ValueError("con_type must be either 'postgres' or 'sqlite'.")
+        raise ValueError("con must be either class psycopg.Connection or sqlite3.Connection.")
     c = con.cursor()
     i = con.cursor()
 
@@ -511,23 +459,21 @@ def convert_gis(con: Union[sqlite.Connection, psycopg.Connection], con_type: str
         log.write('convert_gis function finished in: ' + str(round(gis_time, 2)) + '\n')
 
 
-def update_dt(con: Union[sqlite.Connection, psycopg.Connection], con_type: str, log: TextIO = None,
+def update_dt(con: Union[sqlite.Connection, psycopg.Connection], log: TextIO = None,
               tz_string: str = None):
     """
     Update the dt_orig field in the photo table with datetime from the EXIF metadata.
 
     :param con: Either a sqlite3 or a psycopg2 connection object.
-    :param con_type: character string. Either 'sqlite' or 'postgres'. This tells the function which connection type
-    it is using.
     :param log: text I/O stream. A text file opened in write mode.
     :param tz_string: character string. One of pytz.all_timezones.
     """
-    if con_type == 'postgres':
+    if isinstance(con, psycopg.Connection):
         ph = '%s'
-    elif con_type == 'sqlite':
+    elif isinstance(con, sqlite.Connection):
         ph = '?'
     else:
-        raise ValueError("con_type must be either 'postgres' or 'sqlite'.")
+        raise ValueError("con must be either class psycopg.Connection or sqlite3.Connection.")
     dt_start = datetime.now()
     if tz_string:
         tz = pytz.timezone(tz_string)
@@ -618,26 +564,24 @@ if __name__ == "__main__":
         my_log = None
     # initializes new sqlite database as spatialite database
     if args.dbpath:
-        ctype = 'sqlite'
         if args.geo:
             init_db(dbpath=args.dbpath, overwrite=args.overwrite)
         conn = get_sqlite_con(dbpath=args.dbpath, geo=args.geo)
     else:
-        ctype = 'postgres'
         if args.passwd is None and not args.noask:
             args.passwd = getpass()
         conn = get_pg_con(user=args.user, database=args.db, password=args.passwd, host=args.host, port=args.port)
     if not args.update:
-        create_tables(con=conn, wipe=args.wipe, geo=args.geo, con_type=ctype)
-    my_results, updt, etime = capture_meta(path=args.scanpath, con=conn, con_type=ctype, log=my_log,
+        create_tables(con=conn, wipe=args.wipe, geo=args.geo)
+    my_results, updt, etime = capture_meta(path=args.scanpath, con=conn, log=my_log,
                                            cores=args.cores, chunk_size=args.chunk_size, local=args.local,
                                            multi=args.multi, thumb=args.thumb, maker=args.maker_note,
                                            update=args.update)
     if not args.update:
-        update_dt(con=conn, log=my_log, tz_string=args.timezone, con_type=ctype)
+        update_dt(con=conn, log=my_log, tz_string=args.timezone)
     if args.geo and not args.update:
-        convert_gis(con=conn, log=my_log, con_type=ctype)
-    if ctype == 'sqlite':
+        convert_gis(con=conn, log=my_log)
+    if isinstance(conn, sqlite.Connection):
         # turn off Write Ahead Logging (WAL)
         print(r'disabling WAL ...')
         conn.execute('pragma journal_mode=DELETE;')

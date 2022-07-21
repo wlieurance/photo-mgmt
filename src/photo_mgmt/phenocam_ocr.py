@@ -143,7 +143,6 @@ def convert_date(dt_str):
         return dtp.isoformat(sep=' ')
 
 
-
 def read_photos(dirpath):
     """
     Reads phenocam photos and tries to read the image stamp information that the phenocam impregnates in the image.

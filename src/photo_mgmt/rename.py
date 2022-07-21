@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 import argparse
 import sqlite3 as sqlite
+import psycopg
 import os
 import re
 import csv
 import sys
 import random
+from getpass import getpass
 from datetime import datetime
 from pathlib import Path
+from typing import Union
+from create_db import get_pg_con, get_sqlite_con
 
 
-def rename_files(dbpath, out_format=None, whitespace=None, level=None, match=None, expand=None,
-                 date_frmt='%Y%m%d_%H%M%S', split_dirs=None):
+def rename_files(con: Union[sqlite.Connection, psycopg.Connection], out_format=None, whitespace=None, level=None,
+                 match=None, expand=None, date_frmt='%Y%m%d_%H%M%S', split_dirs=None):
     """Renames files previously stored in a database using scan_image() and a variety of criteria, and then updates the
     new file names in the database.
 
-    :param dbpath: character string. The file path to the sqlite database.
+    :param con: database connection.
     :param out_format: character string. The string representing the new filename with string formatting tags to be
     replaced by actual values. (e.g. {regex}_{timestamp}.jpg).
     :param whitespace: character string. Replace whitespace in the filename with new character(s).
@@ -34,19 +38,12 @@ def rename_files(dbpath, out_format=None, whitespace=None, level=None, match=Non
     useful file data.
     """
     new = []
-    con = sqlite.connect(dbpath)
-    con.row_factory = sqlite.Row
     c = con.cursor()
     sql = '\n'.join((
-        "SELECT a.*,",
-        "       replace(substr(b.value, 1, instr(b.value, ' ')-1), ':', '-') ||",
-        "       ' ' || substr(b.value, instr(b.value, ' ')+1) dt_orig,",
-        "       d.base_path",
+        "SELECT a.*, d.base_path",
         "  FROM photo a",
-        "  LEFT JOIN tag b ON a.md5hash = b.md5hash",
         "  LEFT JOIN hash c ON a.md5hash = c.md5hash",
         "  LEFT JOIN import d ON c.import_date = d.import_date",
-        " WHERE b.tag = 'EXIF DateTimeOriginal'",
         " ORDER BY a.path;"
     ))
     print("Getting records from database...")
@@ -123,21 +120,27 @@ def write_test(out_path, out_dict):
             writer.writerow(name)
 
 
-def write_new(dbpath, out_dict, base=''):
+def write_new(con: Union[sqlite.Connection, psycopg.Connection], out_dict, base: str = ''):
     """
     Renames files and writes renaming results into the database.
 
-    :param dbpath: character string. The path to the photo database.
+    :param con: A database connection object.
     :param out_dict: A list of dictionaries produced from `rename_files`.
     :param base: character string. The base path for the photo paths in the case that relative paths are stored.
     """
-    con = sqlite.connect(dbpath)
-    con.row_factory = sqlite.Row
+    if isinstance(con, psycopg.Connection):
+        ph = '%s'
+        nh = '%({})s'
+    elif isinstance(con, sqlite.Connection):
+        ph = '?'
+        nh = ':{}'
+    else:
+        raise ValueError("con must be either class psycopg.Connection or sqlite3.Connection.")
     c = con.cursor()
     c.execute("DROP TABLE IF EXISTS rename;")
     c.execute("CREATE TEMP TABLE rename (md5hash TEXT, new_path TEXT, old_base TEXT, old_path TEXT, old_fname TEXT);")
     isql = ("INSERT INTO rename (md5hash, old_base, new_path, old_path, old_fname) VALUES "
-            "(:md5hash, :old_base, :new_path, :old_path, :old_name);")
+            f"({nh}, {nh}, {nh}, {nh}, {nh});").format('md5hash', 'old_base', 'new_path', 'old_path', 'old_name')
     c.executemany(isql, out_dict)
     con.commit()
 
@@ -169,7 +172,7 @@ def write_new(dbpath, out_dict, base=''):
         new_path = row['new_path']
         rn = str(row['rn']).rjust(digits, '0')
         altered_path = ''.join((os.path.splitext(new_path)[0], '-', rn, os.path.splitext(new_path)[1]))
-        u.execute('UPDATE rename SET new_path = ? WHERE md5hash = ? AND new_path = ?;',
+        u.execute(f'UPDATE rename SET new_path = {ph} WHERE md5hash = {ph} AND new_path = {ph};',
                   (altered_path, row['md5hash'], new_path))
     con.commit()
 
@@ -182,7 +185,7 @@ def write_new(dbpath, out_dict, base=''):
     else:
         base_path = re.sub(r'\\', '/', base)
         local = True
-    c.execute("INSERT OR IGNORE INTO import (import_date, base_path, local, type) VALUES (?,?,?, 'rename')",
+    c.execute(f"INSERT OR IGNORE INTO import (import_date, base_path, local, type) VALUES ({ph},{ph},{ph}, 'rename')",
               (import_date, base_path, local))
     con.commit()
     rows = c.execute("SELECT * FROM rename;").fetchall()
@@ -198,9 +201,9 @@ def write_new(dbpath, out_dict, base=''):
         except:
             print('Cannot rename', old_fullpath, 'to', new_fullpath)
         else:
-            u.execute('UPDATE photo SET path = ?, fname = ? WHERE md5hash = ? AND path = ?;',
+            u.execute(f'UPDATE photo SET path = {ph}, fname = {ph} WHERE md5hash = {ph} AND path = {ph};',
                       (row['new_path'], os.path.basename(row['new_path']), row['md5hash'], row['old_path']))
-            u.execute('UPDATE hash SET import_date = ? WHERE md5hash = ?;',
+            u.execute(f'UPDATE hash SET import_date = {ph} WHERE md5hash = {ph};',
                       (import_date, row['md5hash']))
             con.commit()
 
@@ -299,7 +302,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
                                      description='This script will rename photos according to specific criteria '
                                                  'and update them in the database.')
-    parser.add_argument('dbpath', help='The path of the spatialite database to be created with the scan_photos module.')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--dbpath',
+                       help='the path of the spatialite database to be created. Default: '
+                            'scanpath/images.sqlite')
+    group.add_argument('--db', help='the PostgreSQL database to which to connect.')
+    args_pg = parser.add_argument_group('PostgreSQL')
+    args_pg.add_argument('--host', default='localhost')
+    args_pg.add_argument('--user', default='postgres')
+    args_pg.add_argument('--port', default=5432, type=int)
+    args_pg.add_argument('--passwd', help="Password for user.")
+    args_pg.add_argument('--noask', action='store_true',
+                         help="User will not be prompted for password if none given.")
     parser.add_argument('-b', '--base', help='The base path for the photos, in the case that only relative file paths '
                                              'are to be stored in the db.')
     parser.add_argument('-l', '--level', help='The level to flatten the directory structure. 0 will remove all '
@@ -329,14 +343,21 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    new_names = rename_files(dbpath=args.dbpath, level=args.level, match=args.match,
+    if args.dbpath:
+        conn = get_sqlite_con(dbpath=args.dbpath, geo=args.geo)
+    else:
+        if args.passwd is None and not args.noask:
+            args.passwd = getpass()
+        conn = get_pg_con(user=args.user, database=args.db, password=args.passwd, host=args.host, port=args.port)
+
+    new_names = rename_files(con=conn, level=args.level, match=args.match,
                              whitespace=args.whitespace, expand=args.expand, date_frmt=args.date_format,
                              split_dirs=args.time_subdirs, out_format=args.rename_string)
 
     if args.test is None:
         go = confirm_write(out_dict=new_names, new_base=args.base)
         if go:
-            write_new(dbpath=args.dbpath, out_dict=new_names, base=args.base)
+            write_new(con=conn, out_dict=new_names, base=args.base)
             if args.delete_empty and args.base is not None:
                 delete_empty(args.base)
         else:
@@ -344,5 +365,7 @@ if __name__ == "__main__":
     else:
         print('Writing test output to', args.test)
         write_test(out_path=args.test, out_dict=new_names)
+    conn.close()
+    conn = None
 
     print('Script finished.')

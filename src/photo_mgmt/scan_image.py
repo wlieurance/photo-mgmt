@@ -18,7 +18,7 @@ from getpass import getpass
 from datetime import datetime
 from operator import itemgetter
 from fuzzywuzzy import fuzz
-from create_db import init_db, get_pg_con, get_sqlite_con, create_tables
+from photo_mgmt.create_db import init_db, get_pg_con, get_sqlite_con, create_tables
 
 # Necessary to fix bad detections of jpegs in imghdr.
 # See https://stackoverflow.com/questions/36870661/imghdr-python-cant-detec-type-of-some-images-image-extension
@@ -323,7 +323,7 @@ def capture_meta(path: str, con: Union[sqlite.Connection, psycopg.Connection], l
     c = con.cursor()
     isql = '\n'.join((f"INSERT {ignore} INTO import (import_date, base_path, local, type) VALUES ",
                       f"({ph},{ph},{ph}, 'import') {conflict};"))
-    c.execute(isql, (import_date, re.sub(r'\\', '/', path), local))
+    c.execute(isql, (import_date, re.sub('/$', '', re.sub(r'\\', '/', path)), local))
     con.commit()
 
     # insert photo data
@@ -423,7 +423,7 @@ def convert_gis(con: Union[sqlite.Connection, psycopg.Connection], log: TextIO =
         """meta ->> 'GPS GPSAltitude' "GPSAltitude", meta ->> 'GPS GPSAltitudeRef' "GPSAltitudeRef" """,
         "  FROM tag)",
         ""
-        "SELECT a.fname, a.path, a.ftype, a.md5hash, a.dt_orig,",
+        "SELECT a.ftype, a.md5hash, a.dt_orig,",
         """b."GPSLongitude", b."GPSLongitudeRef", b."GPSLatitude",""",
         """b."GPSLatitudeRef", b."GPSAltitude", b."GPSAltitudeRef" """,
         "  FROM photo AS a",
@@ -431,8 +431,8 @@ def convert_gis(con: Union[sqlite.Connection, psycopg.Connection], log: TextIO =
     ))
     c.execute(sql)
     rows = c.fetchall()
-    isql = '\n'.join((f'INSERT {ignore} INTO location (md5hash, fname, path, lat, long, elev_m, {geom})',
-                      f'VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{p}({ph},{ph},{ph},4326)) {conflict};'))
+    isql = '\n'.join((f'INSERT {ignore} INTO location (md5hash, lat, long, elev_m, {geom})',
+                      f'VALUES ({ph},{ph},{ph},{ph},{p}({ph},{ph},{ph},4326)) {conflict};'))
     for row in rows:
         if row['GPSLongitude'] is not None:
             x = convert_gps_array(convert_snum_array(str(row['GPSLongitude'])), str(row['GPSLongitudeRef']))
@@ -451,7 +451,7 @@ def convert_gis(con: Union[sqlite.Connection, psycopg.Connection], log: TextIO =
                 log.write('|'.join((row['path'], "GPS coordinate found")) + '\n')
             # print('|'.join((row['path'], "GPS coordinate found")))
             i.execute(isql,
-                      (row['md5hash'], row['fname'], row['path'], x, y, z, x, y, z))
+                      (row['md5hash'], x, y, z, x, y, z))
     con.commit()
     gis_time = (datetime.now() - gis_start).total_seconds()
     print('Spatial conversion finished in', round(gis_time, 2), 'seconds.')

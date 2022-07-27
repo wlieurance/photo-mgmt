@@ -4,10 +4,10 @@ import numpy as np
 import re
 import os
 import csv
-import pandas as pd
+# import pandas as pd
 import argparse
 import dateparser
-from datetime import datetime, timezone, timedelta
+# from datetime import datetime, timezone, timedelta
 
 
 def get_grayscale(image):
@@ -116,7 +116,6 @@ def match_template(image, template):
     :return: cv2.imread object.
     """
     return cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
-
 
 
 def convert_date(dt_str):

@@ -4,17 +4,25 @@ import os
 import hashlib
 import argparse
 import re
+import uuid
 from typing import Union
 from datetime import datetime
 from getpass import getpass
 from photo_mgmt.create_db import get_pg_con, get_sqlite_con
 
 
-def hash_files(scan_path):
+def hash_files(scan_path: str) -> list[tuple]:
+    """
+    Scans a directory and returns the md5 hash for each files found
+
+    :param scan_path: A directory to scan.
+    :return: A list of tuples in the form of (md5 checksum, full path, local path)
+    """
     hash_paths = []
     for root, dirs, files in os.walk(scan_path):
         for f in files:
             full_path = os.path.join(root, f)
+            print(full_path)
             local_path = re.sub(r'^[\\/]', '', full_path.replace(scan_path, ''))
             with open(full_path, 'rb') as file:  # closing and reopening prevents hash inconsistencies
                 try:
@@ -33,7 +41,18 @@ def hash_files(scan_path):
     return hash_paths
 
 
-def update_db(con: Union[sqlite.Connection, psycopg.Connection], base_path, local, hashed):
+def update_db(con: Union[sqlite.Connection, psycopg.Connection], base_path: str, local: bool,
+              hashed: list[tuple]) -> int:
+    """
+    Updates a photo management database with the results of the hash_files function, allowing photos which have been
+    moved or renamed to be reconnected to records in the database.
+
+    :param con: A database connection object.
+    :param base_path: The base path that was scanned in the hash_files function.
+    :param local: Whether to store local paths in relation to base_path or store full paths.
+    :param hashed: The list of hashes produced from the hash_files function.
+    :return: A count of the records updated in the database.
+    """
     if isinstance(con, psycopg.Connection):
         ph = '%s'
         ignore = ''
@@ -42,16 +61,15 @@ def update_db(con: Union[sqlite.Connection, psycopg.Connection], base_path, loca
         ph = '?'
         ignore = 'OR IGNORE'
         conflict = ''
-
     else:
         raise ValueError("con must be either class psycopg.Connection or sqlite3.Connection.")
     hashed_iter = hashed.copy()
     import_date = datetime.utcnow().isoformat(sep='T', timespec='seconds') + 'Z'
     c = con.cursor()
-    c.execute(f"INSERT {ignore} INTO import (import_date, base_path, local, type) VALUES ({ph},{ph},{ph}, 'update') "
-              f"{conflict};",
-              (import_date, re.sub(r'\\', '/', base_path), local))
-    con.commit()
+    c.execute(
+        f"INSERT {ignore} INTO import (import_date, base_path, local, type) VALUES ({ph},{ph},{ph}, 'update') "
+        f"{conflict};",
+        (import_date, re.sub(r'\\', '/', base_path), local))
     sql = '\n'.join((
         "SELECT a.*, b.base_path",
         "  FROM photo a"
@@ -64,6 +82,8 @@ def update_db(con: Union[sqlite.Connection, psycopg.Connection], base_path, loca
         hash_list = [x[0] for x in hashed_iter]
         # old_full = os.path.abspath(os.path.join(row['base_path'], row['path']))
         md5hash = row['md5hash']
+        if isinstance(md5hash, uuid.UUID):
+            md5hash = md5hash.hex
         # using this approach (instead of a join) to deal with duplicate files with same hash
         if md5hash in hash_list:
             idx = hash_list.index(md5hash)
@@ -80,6 +100,8 @@ def update_db(con: Union[sqlite.Connection, psycopg.Connection], base_path, loca
             updated = c.rowcount
             hashed_iter.pop(idx)  # this stops us from reusing the same path for duplicate files with same hash
             count += updated
+    if count == 0:
+        c.execute(f"DELETE FROM import WHERE import_date = {ph};", (import_date,))
     con.commit()
     con.close()
     return count
@@ -108,7 +130,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.dbpath:
-        conn = get_sqlite_con(dbpath=args.dbpath, geo=args.geo)
+        conn = get_sqlite_con(dbpath=args.dbpath, geo=False)
     else:
         if args.passwd is None and not args.noask:
             args.passwd = getpass()

@@ -7,19 +7,22 @@ import re
 import csv
 import sys
 import random
+import uuid
 from getpass import getpass
 from datetime import datetime
 from pathlib import Path
 from typing import Union
-from create_db import get_pg_con, get_sqlite_con
+from photo_mgmt.create_db import get_pg_con, get_sqlite_con
 
 
-def rename_files(con: Union[sqlite.Connection, psycopg.Connection], out_format=None, whitespace=None, level=None,
-                 match=None, expand=None, date_frmt='%Y%m%d_%H%M%S', split_dirs=None):
+def rename_files(con: Union[sqlite.Connection, psycopg.Connection], new_base: str = None, out_format: str = None,
+                 whitespace: str = None, level: int = None, match: str = None, expand: str = None,
+                 date_frmt: str = '%Y%m%d_%H%M%S', split_dirs: str = None) -> list[dict]:
     """Renames files previously stored in a database using scan_image() and a variety of criteria, and then updates the
     new file names in the database.
 
     :param con: database connection.
+    :param new_base:
     :param out_format: character string. The string representing the new filename with string formatting tags to be
     replaced by actual values. (e.g. {regex}_{timestamp}.jpg).
     :param whitespace: character string. Replace whitespace in the filename with new character(s).
@@ -40,11 +43,10 @@ def rename_files(con: Union[sqlite.Connection, psycopg.Connection], out_format=N
     new = []
     c = con.cursor()
     sql = '\n'.join((
-        "SELECT a.*, d.base_path",
+        "SELECT a.*, b.base_path, b.local",
         "  FROM photo a",
-        "  LEFT JOIN hash c ON a.md5hash = c.md5hash",
-        "  LEFT JOIN import d ON c.import_date = d.import_date",
-        " ORDER BY a.path;"
+        "  LEFT JOIN import b ON a.dt_import = b.import_date",
+        " ORDER BY b.import_date, a.path;"
     ))
     print("Getting records from database...")
     rows = c.execute(sql).fetchall()
@@ -53,13 +55,27 @@ def rename_files(con: Union[sqlite.Connection, psycopg.Connection], out_format=N
         # print('row: ', i, ', path: ', row['path'], sep='')
         # get vars
         vd = dict()
-        vd['md5hash'] = row['md5hash']
-        vd['dt'] = datetime.strptime(row['dt_orig'], '%Y-%m-%d %H:%M:%S')
+        if isinstance(row['md5hash'], uuid.UUID):
+            vd['md5hash'] = row['md5hash'].hex
+        else:
+            vd['md5hash'] = row['md5hash']
+        if isinstance(row['dt_orig'], str):
+            vd['dt'] = datetime.strptime(row['dt_orig'], '%Y-%m-%d %H:%M:%S')
+        else:
+            vd['dt'] = row['dt_orig']
+        if new_base is not None:
+            vd['new_base'] = re.sub('/$', '', re.sub(r'\\', '/', new_base))
+        else:
+            vd['new_base'] = row['base_path']
         vd['year'] = vd['dt'].year
         vd['month'] = vd['dt'].month
         vd['old_base'] = row['base_path']
         vd['old_path'] = row['path']
-        vd['old_dir'] = os.path.dirname(row['path'])
+        vd['old_local'] = bool(row['local'])
+        if vd['old_local']:
+            vd['old_dir'] = os.path.dirname(row['path'])
+        else:
+            vd['old_dir'] = re.sub('^/', '', os.path.dirname(row['path']).replace(row['base_path'], ''))
         vd['old_name'] = row['fname']
         vd['old_dt_orig'] = row['dt_orig']
         vd['timestamp'] = vd['dt'].strftime(date_frmt)
@@ -70,17 +86,22 @@ def rename_files(con: Union[sqlite.Connection, psycopg.Connection], out_format=N
 
         # process filename
         if match is not None:
-            matches = re.match(match, vd['old_path'])
+            matches = re.search(match, vd.get('old_path'))
             if matches is not None:
                 if expand is not None:
                     vd['regex'] = matches.expand(expand)
                 else:
                     vd['regex'] = '_'.join(matches.groups())
         if out_format is not None:
-            old_ext = os.path.splitext(vd['old_name'])[1]
-            vd['new_name'] = ''.join((out_format.format(**vd), old_ext.lower()))
+            old_ext = os.path.splitext(vd.get('old_name'))[1]
+            new_ext = os.path.splitext(out_format)[1]
+            if new_ext:
+                out_ext = ''
+            else:
+                out_ext = old_ext
+            vd['new_name'] = ''.join((out_format.format(**vd), out_ext))
         else:
-            vd['new_name'] = vd['old_name']
+            vd['new_name'] = vd.get('old_name')
 
         # restructure path
         if level is not None:
@@ -97,16 +118,17 @@ def rename_files(con: Union[sqlite.Connection, psycopg.Connection], out_format=N
 
         # process full path
         vd['new_path'] = '/'.join((vd['new_dir'], vd['new_name']))
-        vd['new_path'] = re.sub('^/', '', vd['new_path'])  # removes leading / in case of blank new_path
+        vd['new_path'] = os.path.normpath(re.sub('^/', '', vd['new_path']))  # rm leading / in case of blank new_path
+        vd['new_full_path'] = os.path.normpath('/'.join((vd['new_base'], vd['new_dir'], vd['new_name'])))
         if whitespace is not None:
             vd['new_path'] = re.sub(r'\s+', whitespace, vd['new_path'])
+            vd['new_full_path'] = re.sub(r'\s+', whitespace, vd['new_full_path'])
         new.append(vd)
         i += 1
-    con.close()
     return new
 
 
-def write_test(out_path, out_dict):
+def write_test(out_path: str, out_dict: list[dict]):
     """
     Writes the results of `rename_files` to a comma delimited file.
 
@@ -120,27 +142,39 @@ def write_test(out_path, out_dict):
             writer.writerow(name)
 
 
-def write_new(con: Union[sqlite.Connection, psycopg.Connection], out_dict, base: str = ''):
+def write_new(con: Union[sqlite.Connection, psycopg.Connection], out_dict: list[dict], local: bool = False):
     """
     Renames files and writes renaming results into the database.
 
     :param con: A database connection object.
     :param out_dict: A list of dictionaries produced from `rename_files`.
-    :param base: character string. The base path for the photo paths in the case that relative paths are stored.
+    :param local: Boolean. Whether to store a local path instead of a full path.
     """
+    updated = 0
     if isinstance(con, psycopg.Connection):
         ph = '%s'
         nh = '%({})s'
+        ignore = ''
+        conflict = 'ON CONFLICT DO NOTHING'
+        text = 'VARCHAR'
+        uid = 'UUID'
     elif isinstance(con, sqlite.Connection):
         ph = '?'
         nh = ':{}'
+        ignore = 'OR IGNORE'
+        conflict = ''
+        text = 'TEXT'
+        uid = 'TEXT'
     else:
         raise ValueError("con must be either class psycopg.Connection or sqlite3.Connection.")
     c = con.cursor()
     c.execute("DROP TABLE IF EXISTS rename;")
-    c.execute("CREATE TEMP TABLE rename (md5hash TEXT, new_path TEXT, old_base TEXT, old_path TEXT, old_fname TEXT);")
-    isql = ("INSERT INTO rename (md5hash, old_base, new_path, old_path, old_fname) VALUES "
-            f"({nh}, {nh}, {nh}, {nh}, {nh});").format('md5hash', 'old_base', 'new_path', 'old_path', 'old_name')
+    c.execute(f"CREATE TEMP TABLE rename (md5hash {uid}, new_path {text}, new_base {text}, old_path {text}, "
+              f"old_base {text}, old_fname {text}, old_local BOOLEAN);")
+    isql = '\n'.join((
+        "INSERT INTO rename (md5hash, new_path, new_base, old_path, old_base, old_fname, old_local) VALUES ",
+        f"    ({nh}, {nh}, {nh}, {nh}, {nh}, {nh}, {nh});")).format('md5hash', 'new_path', 'new_base', 'old_path',
+                                                                    'old_base', 'old_name', 'old_local')
     c.executemany(isql, out_dict)
     con.commit()
 
@@ -150,7 +184,7 @@ def write_new(con: Union[sqlite.Connection, psycopg.Connection], out_dict, base:
         "SELECT new_path, count(md5hash) n",
         "  FROM rename",
         " GROUP BY new_path",
-        "HAVING n > 1",
+        "HAVING count(md5hash) > 1",
         "",
         "), row_ordered AS (",
         "SELECT a.*,",
@@ -178,47 +212,53 @@ def write_new(con: Union[sqlite.Connection, psycopg.Connection], out_dict, base:
 
     # post-duplicate check, do move/rename and database update
     print('Beginning renaming process...')
-    import_date = datetime.utcnow().isoformat(sep='T', timespec='seconds') + 'Z'
-    if base == '':
-        base_path = None
-        local = False
-    else:
-        base_path = re.sub(r'\\', '/', base)
-        local = True
-    c.execute(f"INSERT OR IGNORE INTO import (import_date, base_path, local, type) VALUES ({ph},{ph},{ph}, 'rename')",
-              (import_date, base_path, local))
-    con.commit()
-    rows = c.execute("SELECT * FROM rename;").fetchall()
-    i = 0  # for progressbar
-    n = len(rows)  # for progressbar
-    for row in rows:
-        old_fullpath = os.path.abspath(os.path.join(row['old_base'], row['old_path']))
-        new_fullpath = os.path.abspath(os.path.join(base, row['new_path']))
-        # print('Renaming', old_fullpath, 'to', new_fullpath)
-        try:
-            Path(os.path.dirname(new_fullpath)).mkdir(parents=True, exist_ok=True)
-            Path(old_fullpath).rename(os.path.abspath(new_fullpath))
-        except:
-            print('Cannot rename', old_fullpath, 'to', new_fullpath)
-        else:
-            u.execute(f'UPDATE photo SET path = {ph}, fname = {ph} WHERE md5hash = {ph} AND path = {ph};',
-                      (row['new_path'], os.path.basename(row['new_path']), row['md5hash'], row['old_path']))
-            u.execute(f'UPDATE hash SET import_date = {ph} WHERE md5hash = {ph};',
-                      (import_date, row['md5hash']))
-            con.commit()
+    new_bases = set([x.get('new_base') for x in out_dict])
+    for base_path in new_bases:
+        import_date = datetime.utcnow().isoformat(sep='T', timespec='seconds') + 'Z'
+        c.execute(f"INSERT {ignore} INTO import (import_date, base_path, local, type) VALUES ({ph},{ph},{ph}, "
+                  f"'rename') {conflict};",
+                  (import_date, base_path, local))
+        con.commit()
+        rows = c.execute(f"SELECT * FROM rename WHERE new_base = {ph};", (base_path,)).fetchall()
+        i = 0  # for progressbar
+        n = len(rows)  # for progressbar
+        for row in rows:
+            if row['old_local']:
+                old_fullpath = os.path.abspath(os.path.join(row['old_base'], row['old_path']))
+            else:
+                old_fullpath = os.path.abspath(row['old_path'])
+            new_fullpath = os.path.abspath(os.path.join(base_path, row['new_path']))
+            # print('Renaming', old_fullpath, 'to', new_fullpath)
+            try:
+                Path(os.path.dirname(new_fullpath)).mkdir(parents=True, exist_ok=True)
+                Path(old_fullpath).rename(os.path.abspath(new_fullpath))
+            except OSError:
+                print('Cannot rename', old_fullpath, 'to', new_fullpath)
+            else:
+                if local:
+                    final_path = row['new_path']
+                else:
+                    final_path = '/'.join((row['new_base'], row['new_path']))
+                u.execute(f'UPDATE photo SET path = {ph}, fname = {ph}, dt_import = {ph} '
+                          f'WHERE md5hash = {ph} AND path = {ph};',
+                          (final_path, os.path.basename(row['new_path']), import_date,
+                           row['md5hash'], row['old_path']))
+                updated += u.rowcount
+                con.commit()
+            # progressbar
+            # https://stackoverflow.com/questions/3002085/python-to-print-out-status-bar-and-percentage
+            j = (i + 1) / n
+            sys.stdout.write('\r')
+            sys.stdout.write("[%-20s] %d%%" % ('=' * int(20 * j), 100 * j))
+            sys.stdout.flush()
+            i += 1
+        if updated == 0:
+            c.execute(f"DELETE FROM import WHERE import_date = {ph};")
+        print(os.linesep)
+        print(updated, "records updated in", base_path)
 
-        # progressbar
-        # https://stackoverflow.com/questions/3002085/python-to-print-out-status-bar-and-percentage
-        j = (i + 1) / n
-        sys.stdout.write('\r')
-        sys.stdout.write("[%-20s] %d%%" % ('=' * int(20 * j), 100 * j))
-        sys.stdout.flush()
-        i += 1
-    print(os.linesep)
-    con.close()
 
-
-def remove_empty_dir(path):
+def remove_empty_dir(path: str):
     """
     Removes empty directories.
 
@@ -231,7 +271,7 @@ def remove_empty_dir(path):
         pass
 
 
-def remove_file(path):
+def remove_file(path: str):
     """
     Attempts to delete a file.
 
@@ -244,7 +284,7 @@ def remove_file(path):
         pass
 
 
-def delete_empty(path):
+def delete_empty(path: str):
     """
     Scans a path for empty directories or those with only a thumbnail database, then removes that directory.
 
@@ -266,13 +306,11 @@ def delete_empty(path):
             remove_empty_dir(dirpath)
 
 
-def confirm_write(out_dict, new_base=None):
+def confirm_write(out_dict: list[dict]) -> bool:
     """
     Acts as a sanity check for interactive execution to print out renamed examples and ask for confirmation.
 
     :param out_dict: A list of dictionaries. The return of `rename_files`.
-    :param new_base: a character string. The base directory for the photos stored in the database if relative paths
-    stored.
     :return: Boolean. True is confirmation to continue.
     """
     print("### RENAMED EXAMPLES ###\n")
@@ -280,12 +318,11 @@ def confirm_write(out_dict, new_base=None):
     for e in print_list:
         print('old dbpath:', e['old_path'].replace('/', os.path.sep))
         print('new dbpath:', e['new_path'].replace('/', os.path.sep))
-        if e['old_base']:
+        if e['old_local']:
             print('old file path:', os.path.join(e['old_base'], e['old_path']).replace('/', os.path.sep))
-        if new_base:
-            print('new file path:', os.path.join(new_base, e['new_path']).replace('/', os.path.sep))
         else:
-            print('new file path:', e['new_path'].replace('/', os.path.sep))
+            print('old file path:', e['old_path'].replace('/', os.path.sep))
+        print('new file path:', e['new_full_path'].replace('/', os.path.sep))
         print(os.linesep)
     ask = input("Are you sure you want to rename/move files with these changes? (y/n): ")
     if ask:
@@ -298,14 +335,47 @@ def confirm_write(out_dict, new_base=None):
     return go
 
 
+def test_check(con: Union[sqlite.Connection, psycopg.Connection], dict_list: list[dict],
+               test: str = None, rm_empty: bool = False):
+    """
+    Initializes the writing functions, i.e. checking for test flags, getting confirmation, and writing results.
+
+    :param con: A database connection object.
+    :param dict_list: The renaming dictionary produced by the rename_files function.
+    :param test: Either None (don't dry run), a path to an output file (write to delimited file), or 'stdout'
+    (print the dry run).
+    :param rm_empty: Remove empty directories from the paths where files were renamed from.
+    """
+    if test is None:
+        go = confirm_write(out_dict=dict_list)
+        if go:
+            write_new(con=con, out_dict=dict_list)
+            if rm_empty:
+                check_paths = set([x.get('old_base') for x in dict_list])
+                for old_base in check_paths:
+                    delete_empty(old_base)
+        else:
+            print('Skipping rename/move and database update.')
+    else:
+        if test != 'stdout':
+            print('Writing test output to', args.test)
+            write_test(out_path=test, out_dict=dict_list)
+        else:
+            for d in dict_list:
+                print(os.path.join(d['old_base'], d['old_path']), '-->', os.path.join(d['new_base'], d['new_path']))
+                for k, v in d.items():
+                    if k not in ['old_base', 'old_path']:
+                        print('\t', k, ": ", v, sep="")
+                print("")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
                                      description='This script will rename photos according to specific criteria '
                                                  'and update them in the database.')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--dbpath',
-                       help='the path of the spatialite database to be created. Default: '
-                            'scanpath/images.sqlite')
+                       help='the path of the spatialite database to use.')
     group.add_argument('--db', help='the PostgreSQL database to which to connect.')
     args_pg = parser.add_argument_group('PostgreSQL')
     args_pg.add_argument('--host', default='localhost')
@@ -314,8 +384,7 @@ if __name__ == "__main__":
     args_pg.add_argument('--passwd', help="Password for user.")
     args_pg.add_argument('--noask', action='store_true',
                          help="User will not be prompted for password if none given.")
-    parser.add_argument('-b', '--base', help='The base path for the photos, in the case that only relative file paths '
-                                             'are to be stored in the db.')
+    parser.add_argument('-b', '--base', help='The new base directory where the renamed files will be stored.')
     parser.add_argument('-l', '--level', help='The level to flatten the directory structure. 0 will remove all '
                                               'sub-folders, 1 will keep first level of sub-folders, etc.',
                         type=int)
@@ -331,40 +400,32 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--rename_string', help='The format for the new filename. Users can use the following '
                                                       'tags in the string: {regex} {timestamp}, {year}, {month}, '
                                                       '{isoyear}, {isoweek}, {isoday}, {old_name}, {md5hash}')
-    parser.add_argument('-t', '--test', help='A file path in which to export the new file paths/names. Choosing this '
-                                             'option will not make any changes to the database or the photo file '
-                                             'structure.')
+    parser.add_argument('-t', '--test', nargs='?', const='stdout',
+                        help='Print the new filenames instead of writing the changes to the database. A file path can '
+                             'optionally be provided to store the results. Choosing this option will not '
+                             'make any changes to the database or the photo file structure.')
     parser.add_argument('-w', '--whitespace',
                         help='Replace whitespace in the new name with the provided string.')
     parser.add_argument('-T', '--time_subdirs', choices=(['year', 'month']),
                         help='Subdivide base directory obtained from --level by either year or month')
     parser.add_argument('-e', '--delete_empty', help='Delete empty folders after the renaming process.',
                         action='store_true')
+    parser.add_argument('-p', '--local', action='store_true',
+                        help='store the local path from the scan directory instead of the full path')
 
     args = parser.parse_args()
 
     if args.dbpath:
-        conn = get_sqlite_con(dbpath=args.dbpath, geo=args.geo)
+        conn = get_sqlite_con(dbpath=args.dbpath, geo=False)
     else:
         if args.passwd is None and not args.noask:
             args.passwd = getpass()
         conn = get_pg_con(user=args.user, database=args.db, password=args.passwd, host=args.host, port=args.port)
 
-    new_names = rename_files(con=conn, level=args.level, match=args.match,
+    new_names = rename_files(con=conn, level=args.level, match=args.match, new_base=args.base,
                              whitespace=args.whitespace, expand=args.expand, date_frmt=args.date_format,
                              split_dirs=args.time_subdirs, out_format=args.rename_string)
-
-    if args.test is None:
-        go = confirm_write(out_dict=new_names, new_base=args.base)
-        if go:
-            write_new(con=conn, out_dict=new_names, base=args.base)
-            if args.delete_empty and args.base is not None:
-                delete_empty(args.base)
-        else:
-            print('Skipping rename/move and database update.')
-    else:
-        print('Writing test output to', args.test)
-        write_test(out_path=args.test, out_dict=new_names)
+    test_check(con=conn, dict_list=new_names, test=args.test, rm_empty=args.delete_empty)
     conn.close()
     conn = None
 

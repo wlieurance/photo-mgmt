@@ -158,7 +158,7 @@ def create_tables(con: Union[sqlite.Connection, psycopg.Connection], wipe: bool 
                 '   FOREIGN KEY (dt_import) REFERENCES import(import_date) ON DELETE CASCADE ON UPDATE CASCADE);')),
             '\n'.join((
                 'CREATE TABLE IF NOT EXISTS tag (',
-                '   md5hash TEXT, meta JSON, PRIMARY KEY (md5hash),',
+                '   md5hash TEXT, meta JSON, width INTEGER, height INTEGER, PRIMARY KEY (md5hash),',
                 '   FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE);'))
         ]
         for sql in sql_list:
@@ -190,28 +190,30 @@ def create_tables(con: Union[sqlite.Connection, psycopg.Connection], wipe: bool 
                 '   import_date TIMESTAMP WITH TIME ZONE,',
                 '   base_path TEXT, local BOOLEAN, type VARCHAR,'
                 '   PRIMARY KEY(import_date));')),
-            'CREATE TABLE IF NOT EXISTS hash (md5hash UUID PRIMARY KEY);',
+            'CREATE TABLE IF NOT EXISTS hash (md5hash VARCHAR(32) PRIMARY KEY);',
             '\n'.join((
                 'CREATE TABLE IF NOT EXISTS photo (',
-                '   path VARCHAR PRIMARY KEY, fname VARCHAR, ftype VARCHAR, md5hash UUID,',
+                '   path VARCHAR PRIMARY KEY, fname VARCHAR, ftype VARCHAR, md5hash VARCHAR(32),',
                 '   dt_orig TIMESTAMP WITH TIME ZONE, dt_mod TIMESTAMP, dt_import TIMESTAMP WITH TIME ZONE,',
                 '   FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE,',
                 '   FOREIGN KEY (dt_import) REFERENCES import(import_date) ON DELETE CASCADE ON UPDATE CASCADE);')),
             '\n'.join((
                 'CREATE TABLE IF NOT EXISTS tag (',
-                '   md5hash UUID, meta JSONB, PRIMARY KEY (md5hash),',
+                '   md5hash VARCHAR(32), meta JSONB, width INTEGER, height INTEGER, PRIMARY KEY (md5hash),',
                 '   FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE);'))
         ]
         for sql in sql_list:
             if verbose:
                 print(sql)
+                print('-----------------------------------------------------')
             c.execute(sql)
+
         # geometry
         if geo:
             geo_list = [
                 'CREATE EXTENSION IF NOT EXISTS postgis;',
                 '\n'.join((
-                    'CREATE TABLE IF NOT EXISTS location (md5hash UUID PRIMARY KEY, fname VARCHAR, path VARCHAR,',
+                    'CREATE TABLE IF NOT EXISTS location (md5hash VARCHAR(32) PRIMARY KEY, fname VARCHAR, path VARCHAR,',
                     '   lat DOUBLE PRECISION, long DOUBLE PRECISION, elev_m DOUBLE PRECISION, ',
                     '   geom GEOMETRY(POINTZ, 4326),',
                     '   FOREIGN KEY (md5hash) REFERENCES hash(md5hash) ON DELETE CASCADE ON UPDATE CASCADE);')),
@@ -220,9 +222,11 @@ def create_tables(con: Union[sqlite.Connection, psycopg.Connection], wipe: bool 
             for gsql in geo_list:
                 if verbose:
                     print(gsql)
+                    print('-----------------------------------------------------')
                 c.execute(gsql)
     else:
         raise ValueError("con must be either class psycopg.Connection or sqlite3.Connection.")
+    # db type unaware triggers
     if wipe:
         c.execute('DELETE FROM tag;')
         c.execute('DELETE FROM photo;')
@@ -234,6 +238,58 @@ def create_tables(con: Union[sqlite.Connection, psycopg.Connection], wipe: bool 
     c.execute("CREATE INDEX IF NOT EXISTS photo_md5hash_idx ON photo (md5hash);")
     # c.execute("CREATE INDEX IF NOT EXISTS tag_value_idx ON tag (value);")
     con.commit()
+
+
+def create_triggers(con: Union[sqlite.Connection, psycopg.Connection], verbose: bool = False):
+    """
+    Creates the triggers if they do not exist in the database.
+
+    :param con: Either a sqlite3 or a psycopg2 connection object.
+    :param verbose: Boolean. Should the function print out each sql statement before executing it.
+    """
+    c = con.cursor()
+    if isinstance(con, sqlite.Connection):
+        trigger_list = [
+            '\n'.join((
+                "CREATE TRIGGER IF NOT EXISTS delete_hash AFTER DELETE ON photo FOR EACH ROW",
+                "BEGIN",
+                "  DELETE FROM hash WHERE md5hash IN (",
+                "    SELECT a.md5hash",
+                "      FROM hash a",
+                "      LEFT JOIN photo b ON a.md5hash = b.md5hash",
+                "     WHERE b.md5hash IS NULL);",
+                "END;"
+            ))
+        ]
+    elif isinstance(con, psycopg.Connection):
+        trigger_list = [
+            "DROP TRIGGER IF EXISTS delete_hash ON photo;",
+            "DROP FUNCTION IF EXISTS check_hash;",
+            '\n'.join((
+                "CREATE FUNCTION check_hash()",
+                "  RETURNS TRIGGER",
+                "  LANGUAGE PLPGSQL",
+                "  AS",
+                "$BODY$",
+                "BEGIN",
+                "     DELETE FROM hash WHERE md5hash IN (",
+                "       SELECT a.md5hash",
+                "         FROM hash a",
+                "         LEFT JOIN photo b ON a.md5hash = b.md5hash",
+                "	WHERE b.md5hash IS NULL);",
+                "     RETURN NULL;",
+                "END;",
+                "$BODY$;"
+            )),
+            "CREATE TRIGGER delete_hash AFTER DELETE ON photo FOR EACH STATEMENT EXECUTE FUNCTION check_hash();"
+        ]
+    else:
+        raise ValueError("con must be either class psycopg.Connection or sqlite3.Connection.")
+    for trigger in trigger_list:
+        if verbose:
+            print(trigger)
+            print('-----------------------------------------------------')
+        c.execute(trigger)
 
 
 if __name__ == "__main__":
@@ -269,7 +325,8 @@ if __name__ == "__main__":
             args.passwd = getpass()
         init_db_pg(user=args.user, database=args.db, password=args.passwd, host=args.host, port=args.port, geo=args.geo)
         conn = get_pg_con(user=args.user, database=args.db, password=args.passwd, host=args.host, port=args.port)
-    create_tables(con=conn, wipe=args.wipe, geo=args.geo)        
+    create_tables(con=conn, wipe=args.wipe, geo=args.geo)
+    create_triggers(con=conn)
     conn.close()
     conn = None
     print("Script finished.")

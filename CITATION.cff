@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+title: Photo Management Tools
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Wade
+    family-names: Lieurance
+    email: wlieurance@gmail.com
+    orcid: 'https://orcid.org/0000-0003-1908-0197'
+repository-code: 'https://github.com/wlieurance/photo-mgmt'
+abstract: >-
+  Photo management CLI tools which:
+
+  1) Extract and store photo hashes and metadata in a
+  relational DB
+
+  2) Rename photos based on metadata and other attributes
+
+  3) Scan and update path information in the database based
+  on matching hash and fuzzy filename match
+keywords:
+  - photo
+  - database
+  - metadata
+  - scan
+license: GPL-3.0

@@ -1,5 +1,15 @@
-# photo_mgmt
-Tools used for photo management.
+# Photo Management Tools
+
+Python based photo management command-line interface (CLI) tools which:
+
+1. Extract and store photo hashes and metadata in a
+relational DB (SQLite or PostgreSQL).
+
+2. Rename photos based on metadata and other attributes
+
+3. Scan and update path information in the database based
+on matching hash and fuzzy filename match
+
 
 # Installation
 Users will need [Python 3](https://www.python.org/) for the python script and [R](https://www.r-project.org/) for the R script

@@ -3,3 +3,6 @@ fuzzywuzzy
 python-Levenshtein
 pytz
 psycopg>=3
+tqdm
+# opencv-python # install if you dont have system libraries
+
